@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikko Rantakoski <mikko.rantakoski@gmail.com>
+Date: Mon, 06 Oct 2026 12:00:00 +0300
+Subject: [PATCH] zx279128: wire SoC platform into ARM build
+
+Wire ARCH_ZX279128 into arch/arm/Kconfig.platforms so the SoC selects its GIC, global timer and serial-core console.
+
+diff --git a/arch/arm/Kconfig.platforms b/arch/arm/Kconfig.platforms
+--- a/arch/arm/Kconfig.platforms
++++ b/arch/arm/Kconfig.platforms
+@@ -58,6 +58,18 @@
+ 
+ endmenu
+ 
++config ARCH_ZX279128
++	bool "ZTE ZX279128 SoC support"
++	depends on ARCH_MULTI_V7 && USE_OF
++	select ARM_GIC
++	select ARM_GLOBAL_TIMER
++	select CLKSRC_ARM_GLOBAL_TIMER_SCHED_CLOCK
++	select SERIAL_CORE
++	select SERIAL_CORE_CONSOLE
++	help
++	  Enable the interrupt controller and global timer for RAM-only
++	  ZX279128 bring-up using a bootloader-initialized fixed timer clock.
++
+ config ARCH_VIRT
+ 	bool "Dummy Virtual Machine"
+ 	depends on ARCH_MULTI_V7
