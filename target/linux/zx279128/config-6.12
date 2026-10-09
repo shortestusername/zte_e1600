@@ -79,3 +79,29 @@ CONFIG_ZX279128_MDIO=y
 # Built-in so eth0 exists before first userspace; depends on PHYLIB
 # which is already pinned y above.
 CONFIG_ZX279128_ETH=y
+# Stage 7.3: PCIe root ports (DWC) + MT7915 Wi-Fi. DWC host glue from
+# patch 1001; PCIE_ZX279128 is the ZTE controller driver. MSI needed for
+# mt76 IRQs. Pinned y (built-in) so PCI is up before firmware hotplug.
+CONFIG_PCI=y
+CONFIG_PCI_DOMAINS=y
+CONFIG_PCI_DOMAINS_GENERIC=y
+CONFIG_PCI_MSI=y
+CONFIG_GENERIC_PCI_IOMAP=y
+CONFIG_PCI_HOST_COMMON=y
+CONFIG_PCIE_DW=y
+CONFIG_PCIE_DW_HOST=y
+CONFIG_PCIE_ZX279128=y
+# Stage 7.3: GPIO controller (patch 1002). 6 banks x 16 lines, flat
+# GPIO_00..63 numbering per datasheet Table 7. IRQCHIP + OF_GPIO so
+# gpio-keys/reset lines can come from DTS.
+CONFIG_GPIO_ZX279133=y
+CONFIG_GPIOLIB_IRQCHIP=y
+CONFIG_OF_GPIO=y
+# Stage 7.3: JFFS2 rootfs on SPI-NAND (generic has it y; pinned here so
+# the RAM-boot -> flash transition never depends on generic config drift).
+CONFIG_JFFS2_FS=y
+# Phase 5 only (L2C coherency): CONFIG_CACHE_L2X0_IO_LOCK is deliberately
+# NOT set yet — needs patch 1003 + mt76 mt76_readl patch + DTS
+# zte,l2c-io-read-lock property all present together. Pinned "is not set"
+# so kernel syncconfig never prompts for the new symbol interactively.
+# CONFIG_CACHE_L2X0_IO_LOCK is not set

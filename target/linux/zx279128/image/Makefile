@@ -18,6 +18,7 @@ define Device/e1600
   IMAGE/ow-kernel.bin := append-kernel
   IMAGE/ow-ubi.bin := append-ubi
   ARTIFACTS :=
+  DEVICE_PACKAGES := kmod-mt7915e kmod-mt7915-firmware
 endef
 TARGET_DEVICES += e1600
 

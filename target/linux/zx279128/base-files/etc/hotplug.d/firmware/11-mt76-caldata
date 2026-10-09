@@ -1,0 +1,41 @@
+#!/bin/sh
+
+[ -e /lib/firmware/$FIRMWARE ] && exit 0
+
+. /lib/functions/caldata.sh
+
+# ZTE keeps the MT7915 calibration as "caldata" in the wifi partition JFFS2.
+# The first 0xe00 bytes are the MT7915 EEPROM image (chip ID 0x7915 at 0x0).
+# The MAC stored in it is a Ralink default (00:0C:43:*); stock firmware
+# overrides it with the tag partition MAC (0x1e, +1 for 5 GHz), so we patch
+# the staged copy the same way.
+zte_caldata_from_jffs2() {
+    local part dir=/tmp/wifi-caldata mac
+
+    part=$(find_mtd_chardev wifi)
+    [ -n "$part" ] || caldata_die "no mtd device for partition wifi"
+
+    mkdir -p $dir
+    mount -t jffs2 -o ro $part $dir || caldata_die "failed to mount $part"
+    [ "$(hexdump -v -n 2 -e '2/1 "%02x"' $dir/caldata 2>/dev/null)" = "1579" ] ||
+        { umount $dir; rmdir $dir; caldata_die "no MT7915 calibration in $part"; }
+    caldata_from_file $dir/caldata 0x0 0xe00
+    umount $dir
+    rmdir $dir
+
+    mac=$(hexdump -n 6 -s 0x1e -e '6/1 "%02x"' $(find_mtd_chardev tag))
+    [ "${mac#000c43}" = "$mac" ] || caldata_die "tag MAC missing"
+    printf "$(echo $mac | sed 's/../\\x&/g')" |
+        dd of=/lib/firmware/$FIRMWARE bs=1 seek=4 conv=notrunc 2>/dev/null
+}
+
+case "$FIRMWARE" in
+"mediatek/mt7915_eeprom.bin"|\
+"mediatek/mt7915_eeprom_dbdc.bin")
+    case "$(board_name)" in
+    zte,zxhn-e1600)
+        zte_caldata_from_jffs2
+        ;;
+    esac
+    ;;
+esac
