@@ -10,15 +10,15 @@
 # overrides it with the tag partition MAC (0x1e, +1 for 5 GHz), so we patch
 # the staged copy the same way.
 zte_caldata_from_jffs2() {
-    local part dir=/tmp/wifi-caldata mac
-
-    part=$(find_mtd_chardev wifi)
-    [ -n "$part" ] || caldata_die "no mtd device for partition wifi"
+    local dir=/tmp/wifi-caldata mac mac2
 
     mkdir -p $dir
-    mount -t jffs2 -o ro $part $dir || caldata_die "failed to mount $part"
+    # mtdsuper resolves "mtd:<name>" through get_mtd_device_nm(); a
+    # /dev/mtdN chardev path is rejected by lookup_bdev() with -ENODEV.
+    mount -t jffs2 -o ro mtd:wifi $dir ||
+        caldata_die "failed to mount mtd:wifi"
     [ "$(hexdump -v -n 2 -e '2/1 "%02x"' $dir/caldata 2>/dev/null)" = "1579" ] ||
-        { umount $dir; rmdir $dir; caldata_die "no MT7915 calibration in $part"; }
+        { umount $dir; rmdir $dir; caldata_die "no MT7915 calibration in mtd:wifi"; }
     caldata_from_file $dir/caldata 0x0 0xe00
     umount $dir
     rmdir $dir
@@ -27,6 +27,10 @@ zte_caldata_from_jffs2() {
     [ "${mac#000c43}" = "$mac" ] || caldata_die "tag MAC missing"
     printf "$(echo $mac | sed 's/../\\x&/g')" |
         dd of=/lib/firmware/$FIRMWARE bs=1 seek=4 conv=notrunc 2>/dev/null
+    # MT_EE_MAC_ADDR2 (0x00a) feeds the second wiphy (5 GHz): tag MAC + 1.
+    mac2=$(printf '%012x' $((0x$mac + 1)))
+    printf "$(echo $mac2 | sed 's/../\\x&/g')" |
+        dd of=/lib/firmware/$FIRMWARE bs=1 seek=10 conv=notrunc 2>/dev/null
 }
 
 case "$FIRMWARE" in

@@ -6,8 +6,12 @@
  * "ZX279121-spifc". See plans/OPENWRT_BUILD_AND_PORT_PLAN.md Phase 7.1 for
  * the full derivation. Implements chip identification, page reads, page
  * program (0x02 load + 0x10 execute) and block erase (0xd8), mirroring the
- * stock sequences byte-for-byte. OOB access is not implemented; the
- * on-die ECC covers main data only as seen by this driver.
+ * stock sequences byte-for-byte. OOB access is implemented through the
+ * ->_read_oob()/->_write_oob() interface: reads stream the full 2112-byte
+ * raw page (main + spare, the same primitive the bad-block scan uses) and
+ * writes do a read-modify-write of the raw page, so JFFS2 cleanmarker and
+ * OOB layout access works while plain mtd_read()/mtd_write() callers
+ * (UBI) keep the exact semantics they had with the old ->_read()/->_write().
  *
  * Controller model (all register offsets are the byte offsets from the MMIO
  * base; the stock disassembly prints them in decimal):
@@ -82,6 +86,7 @@
 #define SPIFC_PAGE_DATA		2048
 #define SPIFC_PAGE_OOB		64
 #define SPIFC_ERASE_SIZE	(128 * 1024)
+#define SPIFC_RAW_PAGE		(SPIFC_PAGE_DATA + SPIFC_PAGE_OOB)
 
 /* Feature addresses for the non-dual-die (ZD35Q1GAIBR) variant. */
 #define FEAT_BLOCK_PROTECT	0xa0
@@ -620,49 +625,190 @@ static int spifc_erase_block(struct spifc *spifc, unsigned int block)
 	return spifc_nand_wait(spifc);
 }
 
-static int spifc_mtd_write(struct mtd_info *mtd, loff_t to, size_t len,
-			   size_t *retlen, const u_char *buf)
+static int spifc_read_page_data(struct spifc *spifc, unsigned int page,
+				u8 *buf, u32 len, u8 *eccs);
+
+/*
+ * Spare-area layout of the ZD35Q1GA raw page (verified against the raw
+ * whole-flash dump: ECC parity bytes live at OOB offsets 8, 24, 40, 56,
+ * one 8-byte group per 512-byte ECC sector; everything else is free).
+ * This is the layout the stock JFFS2 in mtd3/wifi was written with.
+ */
+static int spifc_ooblayout_free(struct mtd_info *mtd, int section,
+				struct mtd_oob_region *region)
+{
+	if (section >= SPIFC_PAGE_OOB / 16)
+		return -ERANGE;
+
+	region->offset = section * 16;
+	region->length = 8;
+	return 0;
+}
+
+static int spifc_ooblayout_ecc(struct mtd_info *mtd, int section,
+			       struct mtd_oob_region *region)
+{
+	if (section >= SPIFC_PAGE_OOB / 16)
+		return -ERANGE;
+
+	region->offset = section * 16 + 8;
+	region->length = 8;
+	return 0;
+}
+
+static const struct mtd_ooblayout_ops spifc_ooblayout = {
+	.free = spifc_ooblayout_free,
+	.ecc = spifc_ooblayout_ecc,
+};
+
+/*
+ * Place ops->oobbuf[ooboffs .. +ooblen] into a raw page buffer.
+ * MTD_OPS_AUTO_OOB maps the user bytes onto the free regions in order;
+ * MTD_OPS_RAW (and MTD_OPS_PLACE_OOB, which we never see from JFFS2/UBI
+ * but mtdchar allows) addresses the spare linearly from column 2048.
+ */
+static int spifc_oob_to_raw(struct mtd_info *mtd, const struct mtd_oob_ops *ops,
+			    u8 *raw)
+{
+	if (!ops->oobbuf || !ops->ooblen)
+		return 0;
+
+	if (ops->mode == MTD_OPS_AUTO_OOB)
+		return mtd_ooblayout_set_databytes(mtd, ops->oobbuf,
+						   raw + SPIFC_PAGE_DATA,
+						   ops->ooboffs, ops->ooblen);
+
+	memcpy(raw + SPIFC_PAGE_DATA + ops->ooboffs, ops->oobbuf,
+	       ops->ooblen);
+	return 0;
+}
+
+/*
+ * Extract the raw page's spare bytes into ops->oobbuf (inverse of
+ * spifc_oob_to_raw).
+ */
+static int spifc_raw_to_oob(struct mtd_info *mtd, struct mtd_oob_ops *ops,
+			    const u8 *raw)
+{
+	if (!ops->oobbuf || !ops->ooblen)
+		return 0;
+
+	if (ops->mode == MTD_OPS_AUTO_OOB)
+		return mtd_ooblayout_get_databytes(mtd, ops->oobbuf,
+						   raw + SPIFC_PAGE_DATA,
+						   ops->ooboffs, ops->ooblen);
+
+	memcpy(ops->oobbuf, raw + SPIFC_PAGE_DATA + ops->ooboffs,
+	       ops->ooblen);
+	return 0;
+}
+
+/*
+ * ->_write_oob(): the cache-program path always writes a full raw page,
+ * so a partial write is a read-modify-write of the raw page. This also
+ * lifts the old "page-aligned only" restriction of ->_write(): mtdchar
+ * partial writes and JFFS2 write-buffer flushes now work. The chip
+ * regenerates the on-die ECC parity on program, so the parity bytes in
+ * the RMW'd raw image are harmless.
+ */
+static int spifc_mtd_write_oob(struct mtd_info *mtd, loff_t to,
+			       struct mtd_oob_ops *ops)
 {
 	struct spifc *spifc = mtd_to_spifc(mtd);
-	u8 *page;
+	size_t len = ops->len;
+	u8 *buf = ops->datbuf;
+	u8 *raw;
 	int ret = 0;
 
-	*retlen = 0;
-	if (!len)
+	ops->retlen = 0;
+	if (!len && !ops->ooblen)
 		return 0;
 	if (to + len > mtd->size)
 		return -EINVAL;
-	/*
-	 * The cache-program path has no partial-page read-modify-write
-	 * (OOB is not exposed), so require page-aligned writes. flashcp
-	 * and nandwrite both satisfy this.
-	 */
-	if (to % SPIFC_PAGE_DATA || len % SPIFC_PAGE_DATA)
+	if (ops->ooblen && !ops->oobbuf)
 		return -EINVAL;
 
-	page = kmalloc(SPIFC_PAGE_DATA, GFP_KERNEL);
-	if (!page)
+	raw = kmalloc(SPIFC_RAW_PAGE, GFP_KERNEL);
+	if (!raw)
 		return -ENOMEM;
 
 	spin_lock_bh(&spifc->lock);
 
-	while (len) {
+	while (len || (ops->oobbuf && ops->oobretlen < ops->ooblen)) {
 		unsigned int pnum = div_u64(to, SPIFC_PAGE_DATA);
+		unsigned int off = to % SPIFC_PAGE_DATA;
+		size_t chunk = min_t(size_t, SPIFC_PAGE_DATA - off, len);
+		struct mtd_oob_ops pop = *ops;
+		unsigned int spare_done;
+		unsigned int spare_left;
 
-		memcpy(page, buf, SPIFC_PAGE_DATA);
+		/* Per-page slice of the data request. */
+		pop.datbuf = buf;
+		pop.len = chunk;
 
-		ret = spifc_program_page(spifc, pnum, page, SPIFC_PAGE_DATA);
+		/* Per-page slice of the OOB request (AUTO: free bytes of
+		 * this page still pending; RAW: linear spare bytes). The
+		 * per-page OOB window wraps at oobavail (AUTO) or
+		 * oobsize (RAW) when the request spans pages.
+		 */
+		spare_done = ops->oobretlen;
+		spare_left = ops->ooblen - spare_done;
+		if (spare_left) {
+			unsigned int wrap = (ops->mode == MTD_OPS_AUTO_OOB) ?
+					    mtd->oobavail : mtd->oobsize;
+			unsigned int first = ops->ooboffs + spare_done;
+
+			pop.ooboffs = first % wrap;
+			pop.ooblen = min_t(unsigned int, spare_left,
+					   wrap - pop.ooboffs);
+		} else {
+			pop.ooboffs = 0;
+			pop.ooblen = 0;
+		}
+		pop.oobbuf = ops->oobbuf ? ops->oobbuf + spare_done : NULL;
+
+		if (pop.ooblen == 0 && off == 0 && chunk == SPIFC_PAGE_DATA) {
+			/* Full-page data-only write: the proven fast path,
+			 * byte-identical to the old ->_write() (UBI/flashcp).
+			 */
+			ret = spifc_program_page(spifc, pnum, buf,
+						 SPIFC_PAGE_DATA);
+		} else {
+			/* Partial data and/or OOB: read-modify-write the
+			 * raw page so the untouched bytes survive.
+			 */
+			ret = spifc_read_page_data(spifc, pnum, raw,
+						   SPIFC_RAW_PAGE, NULL);
+			if (ret)
+				break;
+
+			if (chunk)
+				memcpy(raw + off, buf, chunk);
+
+			ret = spifc_oob_to_raw(mtd, &pop, raw);
+			if (ret)
+				break;
+
+			ret = spifc_program_page(spifc, pnum, raw,
+						 SPIFC_RAW_PAGE);
+		}
 		if (ret)
 			break;
 
-		buf += SPIFC_PAGE_DATA;
-		to += SPIFC_PAGE_DATA;
-		len -= SPIFC_PAGE_DATA;
-		*retlen += SPIFC_PAGE_DATA;
+		if (chunk) {
+			buf += chunk;
+			to += chunk;
+			len -= chunk;
+			ops->retlen += chunk;
+		}
+		ops->oobretlen += pop.ooblen;
+		/* OOB spilling past this page continues on the next one. */
+		if (!len && ops->oobretlen < ops->ooblen)
+			to = (loff_t)(pnum + 1) * SPIFC_PAGE_DATA;
 	}
 
 	spin_unlock_bh(&spifc->lock);
-	kfree(page);
+	kfree(raw);
 
 	return ret;
 }
@@ -777,23 +923,32 @@ static int spifc_read_page_data(struct spifc *spifc, unsigned int page,
 	return spifc_wait_done(spifc);
 }
 
-static int spifc_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
-			  size_t *retlen, u_char *buf)
+/*
+ * ->_read_oob(): every page is streamed as a full 2112-byte raw page
+ * (the same primitive the bad-block scan uses), so main data and spare
+ * bytes come from one transaction. With ops->datbuf only (the path
+ * mtd_read()/UBI use) the ECC accounting and return value are identical
+ * to the old ->_read(): max bitflips, or -EBADMSG on uncorrectable.
+ */
+static int spifc_mtd_read_oob(struct mtd_info *mtd, loff_t from,
+			      struct mtd_oob_ops *ops)
 {
 	struct spifc *spifc = mtd_to_spifc(mtd);
 	unsigned int max_flips = 0;
 	bool failed = false;
-	u8 *page;
+	u8 *raw;
 	int ret = 0;
 
-	*retlen = 0;
-	if (!len)
+	ops->retlen = 0;
+	if (!ops->len && !ops->ooblen)
 		return 0;
-	if (from + len > mtd->size)
+	if (from + ops->len > mtd->size)
+		return -EINVAL;
+	if (ops->ooblen && !ops->oobbuf)
 		return -EINVAL;
 
-	page = kmalloc(SPIFC_PAGE_DATA, GFP_KERNEL);
-	if (!page)
+	raw = kmalloc(SPIFC_RAW_PAGE, GFP_KERNEL);
+	if (!raw)
 		return -ENOMEM;
 
 	/*
@@ -803,14 +958,50 @@ static int spifc_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 	 */
 	spin_lock_bh(&spifc->lock);
 
-	while (len) {
+	while (ops->retlen < ops->len ||
+	       (ops->oobbuf && ops->oobretlen < ops->ooblen)) {
 		unsigned int pnum = div_u64(from, SPIFC_PAGE_DATA);
 		unsigned int off = from % SPIFC_PAGE_DATA;
-		size_t chunk = min_t(size_t, SPIFC_PAGE_DATA - off, len);
+		size_t chunk = 0;
+		struct mtd_oob_ops pop = *ops;
+		unsigned int spare_done;
+		unsigned int spare_left;
 		u8 eccs = 0;
 
-		ret = spifc_read_page_data(spifc, pnum, page, SPIFC_PAGE_DATA,
-					  &eccs);
+		if (ops->retlen < ops->len) {
+			chunk = min_t(size_t, SPIFC_PAGE_DATA - off,
+				      ops->len - ops->retlen);
+			pop.datbuf = ops->datbuf + ops->retlen;
+			pop.len = chunk;
+		} else {
+			pop.datbuf = NULL;
+			pop.len = 0;
+		}
+
+		spare_done = ops->oobretlen;
+		spare_left = ops->ooblen - spare_done;
+		if (spare_left) {
+			unsigned int wrap = (ops->mode == MTD_OPS_AUTO_OOB) ?
+					    mtd->oobavail : mtd->oobsize;
+			unsigned int first = ops->ooboffs + spare_done;
+
+			pop.ooboffs = first % wrap;
+			pop.ooblen = min_t(unsigned int, spare_left,
+					   wrap - pop.ooboffs);
+		} else {
+			pop.ooboffs = 0;
+			pop.ooblen = 0;
+		}
+		pop.oobbuf = ops->oobbuf ? ops->oobbuf + spare_done : NULL;
+
+		/* Data-only requests read the main area only, exactly like
+		 * the old ->_read() (the proven UBI path); anything with
+		 * OOB streams the full raw page.
+		 */
+		ret = spifc_read_page_data(spifc, pnum, raw,
+					   pop.ooblen ? SPIFC_RAW_PAGE :
+							SPIFC_PAGE_DATA,
+					   &eccs);
 		if (ret)
 			break;
 
@@ -827,15 +1018,25 @@ static int spifc_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 			max_flips = max(max_flips, flips);
 		}
 
-		memcpy(buf, page + off, chunk);
-		buf += chunk;
-		from += chunk;
-		len -= chunk;
-		*retlen += chunk;
+		if (chunk)
+			memcpy(pop.datbuf, raw + off, chunk);
+
+		ret = spifc_raw_to_oob(mtd, &pop, raw);
+		if (ret)
+			break;
+
+		if (chunk) {
+			from += chunk;
+			ops->retlen += chunk;
+		}
+		ops->oobretlen += pop.ooblen;
+		/* OOB spilling past this page continues on the next one. */
+		if (!chunk && ops->oobretlen < ops->ooblen)
+			from = (loff_t)(pnum + 1) * SPIFC_PAGE_DATA;
 	}
 
 	spin_unlock_bh(&spifc->lock);
-	kfree(page);
+	kfree(raw);
 
 	if (ret)
 		return ret;
@@ -845,7 +1046,6 @@ static int spifc_mtd_read(struct mtd_info *mtd, loff_t from, size_t len,
 }
 
 #define SPIFC_PAGES_PER_BLOCK	(SPIFC_ERASE_SIZE / SPIFC_PAGE_DATA)
-#define SPIFC_RAW_PAGE		(SPIFC_PAGE_DATA + SPIFC_PAGE_OOB)
 
 /*
  * Bad-block mark: first spare byte (column 2048) of the block's first page,
@@ -952,23 +1152,26 @@ static int spifc_probe(struct platform_device *pdev)
 	mtd->writebufsize = SPIFC_PAGE_DATA;	/* UBI rejects 0 */
 	mtd->erasesize = SPIFC_ERASE_SIZE;
 	mtd->oobsize = SPIFC_PAGE_OOB;
-	mtd->oobavail = SPIFC_PAGE_OOB;
+	/* 32 of the 64 spare bytes are free; the other 32 hold the
+	 * on-die ECC parity (4 x 8 B at OOB offsets 8/24/40/56).
+	 */
+	mtd->oobavail = SPIFC_PAGE_OOB / 2;
+	mtd_set_ooblayout(mtd, &spifc_ooblayout);
 	/* On-die BCH: 8 bits per 512 B (datasheet 13.4). */
 	mtd->ecc_strength = 8;
 	mtd->ecc_step_size = 512;
 	mtd->bitflip_threshold = 6;
-	mtd->_read = spifc_mtd_read;
-	mtd->_write = spifc_mtd_write;
+	/*
+	 * add_mtd_device() rejects a device implementing BOTH ->_read and
+	 * ->_read_oob (WARN_ON -> -EINVAL), so the OOB entry points fully
+	 * replace the plain ones: mtd_read()/mtd_write() (UBI) arrive here
+	 * as datbuf-only ops and keep the old semantics.
+	 */
+	mtd->_read_oob = spifc_mtd_read_oob;
+	mtd->_write_oob = spifc_mtd_write_oob;
 	mtd->_erase = spifc_mtd_erase;
 	mtd->_block_isbad = spifc_mtd_block_isbad;
 	mtd->_block_markbad = spifc_mtd_block_markbad;
-	/*
-	 * add_mtd_device() rejects a device implementing BOTH ->_read and
-	 * ->_read_oob (WARN_ON -> -EINVAL), so the stub above must not be
-	 * hooked up: mtd_read_oob() already falls back to ->_read through
-	 * mtd_read_oob_std() when ->_read_oob is NULL, so plain reads keep
-	 * working and OOB simply stays unsupported for this gate.
-	 */
 	mtd->flags = MTD_WRITEABLE;
 
 	platform_set_drvdata(pdev, spifc);

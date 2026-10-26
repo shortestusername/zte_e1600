@@ -35,7 +35,7 @@ Signed-off-by: Navid Ghahremani <ghahramani.navid@gmail.com>
  # pci_root.c driver but don't support standard ECAM config access.
 --- /dev/null
 +++ b/drivers/pci/controller/dwc/pcie-zx279128.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,392 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * ZTE ZX279128S PCIe Host Controller Driver
@@ -70,31 +70,37 @@ Signed-off-by: Navid Ghahremani <ghahramani.navid@gmail.com>
 +
 +#define to_zx_pcie(x)	dev_get_drvdata((x)->dev)
 +
-+static bool zx_board_reset_done;
-+
 +static void zx279128_pcie_init_hw(struct zx_pcie *pcie)
 +{
 +	struct dw_pcie *pci = &pcie->pci;
 +	struct device *dev = pci->dev;
 +
-+	if (!zx_board_reset_done) {
-+		zx_board_reset_done = true;
-+		dev_info(dev, "asserting MT7915 board reset (GPIO 53 and 55 LOW = 0V)\n");
-+		if (pcie->reset_gpio)
-+			gpiod_direction_output_raw(pcie->reset_gpio, 0);
-+		if (pcie->enable_gpio)
-+			gpiod_direction_output_raw(pcie->enable_gpio, 0);
-+		msleep(100);
-+
-+		dev_info(dev, "releasing MT7915 board reset (GPIO 53 and 55 HIGH = 3.3V)\n");
-+		if (pcie->reset_gpio)
-+			gpiod_set_raw_value_cansleep(pcie->reset_gpio, 1);
-+		if (pcie->enable_gpio)
-+			gpiod_set_raw_value_cansleep(pcie->enable_gpio, 1);
-+		msleep(200);
-+	}
++	/* The MT7915 is powered, reset-released and firmware-booted by U-Boot
++	 * before Linux starts (its MTK WLAN driver loads the firmware:
++	 * "eeFlashId=7915"), and neither U-Boot nor the stock Linux driver
++	 * ever toggles the board enable/reset lines afterwards. Pulsing the
++	 * enable line (pad 55) restarts the MT7915 boot flow: the PHY still
++	 * trains to L0 (LTSSM 0x11) but the chip's PCIe function answers no
++	 * config request until its firmware is back, and the resulting
++	 * completion timeout escalates into a CPU external abort (DFS 0x2d)
++	 * on the very first bus-0 config read. Leave the chip exactly as
++	 * U-Boot left it; only make sure the enable line is HIGH.
++	 */
++	if (pcie->enable_gpio)
++		gpiod_set_raw_value_cansleep(pcie->enable_gpio, 1);
++	if (pcie->reset_gpio)
++		gpiod_set_raw_value_cansleep(pcie->reset_gpio, 1);
 +
 +	dev_info(dev, "pcie%d: configuring CRM registers\n", pcie->port_id);
++
++	/* Top CRM 2 (0x94100000): PCIe global clock enable. Stock driver
++	 * writes 0xff here once in probe before any per-port setting;
++	 * without it the PHY clocks stay gated and LTSSM never leaves
++	 * Detect.Quiet (verified against live stock: 0x9410009c == 0xff).
++	 */
++	writel(0xff, pcie->topcrm2 + 0x9c);
++	udelay(50);
++	dev_info(dev, "pcie%d: 0x9c clock-enable done\n", pcie->port_id);
 +
 +	if (pcie->port_id == 0) {
 +		/* Port 0 setting sequence from ZTE firmware */
@@ -192,8 +198,29 @@ Signed-off-by: Navid Ghahremani <ghahramani.navid@gmail.com>
 +		if (((val >> 17) & 0x3f) == 0x11) {
 +			u32 link_stat = readl(pci->dbi_base + 0x80);
 +			u32 speed = (link_stat >> 16) & 0xf;
++			struct dw_pcie_rp *pp = &pcie->pci.pp;
++			struct dw_pcie_ob_atu_cfg atu = { 0 };
++
 +			dev_info(pci->dev, "pcie%d link up, gen%u (LTSSM L0, stat 0x%08x)\n",
 +				 pcie->port_id, speed ? 2 : 1, val);
++
++			/* Diagnostic: read the endpoint VID/DID through the
++			 * CFG0 window before the PCI core touches it. Safe
++			 * here: iATU geometry is known (setup_rc ran) and the
++			 * link is up. If the chip were silent this read
++			 * would escalate into a CPU external abort on this
++			 * SoC, so the value printed here is the last thing
++			 * seen in that case; when it answers we expect
++			 * 0x791514c3 (port 0) / 0x791614c3 (port 1).
++			 */
++			atu.type = PCIE_ATU_TYPE_CFG0;
++			atu.cpu_addr = pp->cfg0_base;
++			atu.pci_addr = PCIE_ATU_BUS(0) | PCIE_ATU_DEV(0) |
++				       PCIE_ATU_FUNC(0);
++			atu.size = pp->cfg0_size;
++			if (!dw_pcie_prog_outbound_atu(pci, &atu))
++				dev_info(pci->dev, "pcie%d: CFG0 bus0/dev0 VID:DID = 0x%08x\n",
++					 pcie->port_id, readl(pp->va_cfg0_base));
 +			return 0;
 +		}
 +		udelay(100);
@@ -218,8 +245,71 @@ Signed-off-by: Navid Ghahremani <ghahramani.navid@gmail.com>
 +	.start_link	= zx_pcie_start_link,
 +};
 +
++/*
++ * The MT7915 is wired directly to each DWC root port with no intervening
++ * PCI-to-PCI bridge: the stock ZTE driver enumerates it as a plain type-0
++ * endpoint sitting on the root bus itself (pci 0000:00:00.0 on port 0,
++ * pci 0000:01:00.0 on port 1), never as a device behind a bridge.
++ *
++ * The generic DWC host code instead exposes the controller's own DBI header
++ * at bus 0 / dev 0. That header is a type-1 bridge, so the PCI core assigns
++ * it a secondary bus and scans the child bus with a CFG1 (type-1) config
++ * request. The MT7915 does not sit behind that bridge and never completes a
++ * type-1 request; on this SoC the missing completion escalates straight into
++ * a CPU external abort (Oops in pci_generic_config_read), halting the box.
++ *
++ * Override the root-bus config ops so every access is emitted as a CFG0
++ * (type-0) request aimed at bus 0 / dev 0, reaching the endpoint directly
++ * exactly like the stock driver. Only dev 0 / func 0 exists, so any other
++ * device/function returns "no device" without ever putting a TLP on the
++ * link - a stray request to an absent function would hang the same way.
++ */
++static void __iomem *zx_pcie_conf_map_bus(struct pci_bus *bus,
++					  unsigned int devfn, int where)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++	struct dw_pcie *pci = to_dw_pcie_from_pp(pp);
++	struct dw_pcie_ob_atu_cfg atu = { 0 };
++
++	if (devfn != 0)
++		return NULL;
++
++	if (!dw_pcie_link_up(pci))
++		return NULL;
++
++	atu.type = PCIE_ATU_TYPE_CFG0;
++	atu.cpu_addr = pp->cfg0_base;
++	atu.pci_addr = PCIE_ATU_BUS(0) | PCIE_ATU_DEV(0) | PCIE_ATU_FUNC(0);
++	atu.size = pp->cfg0_size;
++
++	if (dw_pcie_prog_outbound_atu(pci, &atu))
++		return NULL;
++
++	return pp->va_cfg0_base + where;
++}
++
++static struct pci_ops zx_pcie_ops = {
++	.map_bus = zx_pcie_conf_map_bus,
++	.read = pci_generic_config_read,
++	.write = pci_generic_config_write,
++};
++
 +static int zx_pcie_host_init(struct dw_pcie_rp *pp)
 +{
++	/*
++	 * Reach the MT7915 as a type-0 endpoint on the root bus (see
++	 * zx_pcie_conf_map_bus). Keep child_ops as the DWC default so
++	 * dw_pcie_setup_rc() still programs the MEM outbound windows; the
++	 * endpoint is not a bridge, so no child bus is ever scanned.
++	 *
++	 * Do NOT program the CFG0 iATU window from here: dw_pcie_host_init()
++	 * calls ops->init before dw_pcie_iatu_setup() has discovered the
++	 * iATU geometry, so pci->region_align is still 0 and
++	 * dw_pcie_prog_outbound_atu() would reject the window (-EINVAL).
++	 * The window is programmed per-access in zx_pcie_conf_map_bus().
++	 */
++	pp->bridge->ops = &zx_pcie_ops;
++
 +	return 0;
 +}
 +

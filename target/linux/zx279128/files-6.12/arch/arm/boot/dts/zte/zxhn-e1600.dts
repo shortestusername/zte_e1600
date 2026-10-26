@@ -1,5 +1,7 @@
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
+
 / {
     #address-cells = <1>;
     #size-cells = <1>;
@@ -71,8 +73,19 @@
 
     intc: interrupt-controller@801000 {
         compatible = "arm,cortex-a9-gic";
-        #address-cells = <1>;
-        #size-cells = <1>;
+        /*
+         * A GIC is a leaf interrupt controller: it must NOT carry
+         * #address-cells/#size-cells. When present they leak into
+         * of_irq_parse_imap_parent() while resolving the PCIe
+         * interrupt-map: addrsize becomes 1, so the parent specifier
+         * "<&intc 0 63 4>" is read shifted by one cell (type=63
+         * instead of SPI 0) and gic_irq_domain_translate() rejects it
+         * (-EINVAL). The endpoint then gets dev->irq == 0, the INTx
+         * fallback in pci_alloc_irq_vectors_affinity() is skipped, and
+         * mt7915e probe fails with -ENOTSUPP (-524). The H3600
+         * reference GIC node has no #address-cells for exactly this
+         * reason.
+         */
         #interrupt-cells = <3>;
         interrupt-controller;
         reg = <0x00801000 0x1000>, <0x00800100 0x100>;
@@ -243,15 +256,33 @@
 
     /* PCIe root ports (driver pcie-zx279128, patch 1001). Same SoC as
      * H3600: DBI/ctrl/config bases and outbound windows identical (F3),
-     * IRQs match stock E1600 DT (F2: SPI 63 / 78). NO reset/enable
-     * GPIOs (plan D4): stock Linux never drives PCIE_RSTB pads 52/54
-     * (boot log), reset is U-Boot/board-held, driver requests them
-     * optionally. L2C node deliberately absent (F8, Phase 5). */
+     * IRQs match stock E1600 DT (F2: SPI 63 / 78). The MT7915 is a single
+     * dual-HIF chip shared by both ports, so its reset/enable pad is pulsed
+     * exactly once, from the FIRST probe (pcie0), before either port trains
+     * its link - see zx_board_reset_done in the driver. Pad 55
+     * (PCIE1_nCLKREQ) is the one stock Linux itself drives as output-HIGH
+     * (bank3 DIR=0x84/DATA=0xA0A0 live snapshot) and pulsing it is what
+     * brought port 1's link up; pad 53 stays untouched because stock leaves
+     * it an input (driving it risks contention with the chip's own
+     * CLKREQ# driver). L2C node deliberately absent (F8, Phase 5). */
     pcie0: pcie@f000000 {
         compatible = "zte,zx279128s-pcie";
+        /* The "config" window size is deliberately 64 KiB (0x10000),
+         * matching the CFG0 iATU window stock programs (base
+         * 0x1c000000, limit 0x1c00ffff - see tmp/stock_re2.log OB1),
+         * NOT the 2 MiB the aperture reserves. A 2 MiB-aligned base AND
+         * 2 MiB size makes ARM __arm_ioremap_pfn_caller take the
+         * !SMP/!LPAE remap_area_sections() path, which writes the
+         * MT_UNCACHED section descriptor verbatim (PMD_TYPE_SECT|XN,
+         * AP=00 = no-access under v7 TEX-remap) and never ORs in the
+         * kernel AP bits -> first config read faults (FSR 0x2d,
+         * *pgd=1c000052). A non-2 MiB size forces the page-table path
+         * (ioremap_page_range) which applies kern_pgprot correctly.
+         * Stock never hits this because it is an SMP kernel (page path
+         * always). */
         reg = <0x0f000000 0x4000>,   /* DBI registers */
               <0x09500000 0x1000>,   /* ctrl registers */
-              <0x1c000000 0x200000>; /* config & PHY registers */
+              <0x1c000000 0x10000>;  /* config window (CFG0 iATU) */
         reg-names = "dbi", "ctrl", "config";
         #address-cells = <3>;
         #size-cells = <2>;
@@ -269,14 +300,17 @@
                         <0 0 0 4 &intc 0 63 4>;
         linux,pci-domain = <0>;
         port-id = <0>;
+        enable-gpios = <&gpio3 7 GPIO_ACTIVE_HIGH>;
         status = "okay";
     };
 
     pcie1: pcie@f100000 {
         compatible = "zte,zx279128s-pcie";
+        /* Config window 64 KiB for the same reason as pcie0: avoid the
+         * !SMP 2 MiB section-mapping ioremap path (AP=00 fault). */
         reg = <0x0f100000 0x4000>,   /* DBI registers */
               <0x09600000 0x1000>,   /* ctrl registers */
-              <0x2c000000 0x200000>; /* config & PHY registers */
+              <0x2c000000 0x10000>;  /* config window (CFG0 iATU) */
         reg-names = "dbi", "ctrl", "config";
         #address-cells = <3>;
         #size-cells = <2>;

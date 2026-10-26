@@ -1,0 +1,46 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Give the two radios distinguishable default SSIDs.
+#
+# /sbin/wifi config (run earlier in the boot sequence) auto-generates
+# /etc/config/wireless with a single "OpenWrt" SSID on every radio, so both
+# bands broadcast the same name and a client cannot tell 2.4 GHz from 5 GHz.
+# This script runs from uci_apply_defaults() after that file exists and
+# renames each default AP by the band of its parent wifi-device.
+#
+# Section names default_radio0 / default_radio1 are the ones netifd's
+# mac80211 detect emits for this board (radio0 = 2g, radio1 = 5g).
+
+# uci_apply_defaults() already sources this, but source it here too so the
+# script also works when run by hand.
+. /lib/functions/system.sh
+
+[ "$(board_name)" = "zte,zxhn-e1600" ] || exit 0
+
+# Explicit per-radio mapping keeps this deterministic for the fixed E1600
+# layout (radio0 = 2g, radio1 = 5g) and avoids depending on interface
+# enumeration order. For each radio, find the wifi-iface whose "device"
+# points at it and set a band-specific SSID on that AP only.
+for radio in radio0 radio1; do
+    band=$(uci -q get wireless."$radio".band)
+    case "$band" in
+        2g) ssid="OpenWrt-2.4GHz" ;;
+        5g) ssid="OpenWrt-5GHz" ;;
+        6g) ssid="OpenWrt-6GHz" ;;
+        *) continue ;;
+    esac
+    iface=$(uci -q show wireless | \
+        sed -n "s/^wireless\.\([^.]*\)\.device='$radio'\$/\1/p" | head -n1)
+    [ -n "$iface" ] || continue
+    uci -q set wireless."$iface".ssid="$ssid"
+    # wifi-scripts' mac80211.uc provisions auto-generated APs with
+    # disabled='1' unless the board has a wlan.defaults entry (it has
+    # none here), which silently kills both radios on every clean
+    # first-boot provisioning (observed 2026-10-26 on the SMP rootfs).
+    # This board ships Wi-Fi enabled: clear the flag.
+    uci -q delete wireless."$iface".disabled
+done
+
+uci commit wireless
+
+exit 0
