@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mikko Rantakoski <mikko.rantakoski@gmail.com>
+Date: Thu, 23 Oct 2026 10:00:00 +0300
+Subject: [PATCH] zx279128: build mach-zx279128 for SMP platsmp
+
+Add the machine-$(CONFIG_ARCH_ZX279128) entry so the mach-zx279128
+directory (platsmp.c, CPU_METHOD_OF_DECLARE "zte,zx279128-smp") is
+compiled into the kernel when the SoC platform is enabled.
+
+diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+@@ -224,6 +224,7 @@
+ machine-$(CONFIG_ARCH_U8500)		+= ux500
+ machine-$(CONFIG_ARCH_VT8500)		+= vt8500
+ machine-$(CONFIG_ARCH_ZYNQ)		+= zynq
++machine-$(CONFIG_ARCH_ZX279128)		+= zx279128
+ machine-$(CONFIG_PLAT_VERSATILE)	+= versatile
+ machine-$(CONFIG_PLAT_SPEAR)		+= spear
+ 

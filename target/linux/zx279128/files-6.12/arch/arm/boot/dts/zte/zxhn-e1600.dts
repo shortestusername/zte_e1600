@@ -18,14 +18,25 @@
         serial1 = &uart1;
     };
 
-    /* 224 MiB of the 256 MiB board RAM: the stock firmware keeps a
-     * reservation around 0x4e700000 that must stay untouched, so Linux
-     * allocations stop at 0x4e000000 (see extraction plan mem=224M note).
-     * The top 13 MiB below that limit is carved out below as the
-     * Ethernet buffer pool. */
+    /* Full 256 MiB of board RAM (Gate F2, 2026-10-25, after Gate F
+     * proved 2-CPU cold boot). The top region is the stock PON/TM
+     * packet-buffer area and is carved out as ponbuf below, matching
+     * the stock kernel: stock boots mem=256M with 36208K reserved
+     * (boot log "Memory: 225936K/262144K") and its static map
+     * ioremaps 0x4e700000 (boot log "BUG: mapping for 0x4e700000 at
+     * 0xf1000000"). CRITICAL (Gate F2, 2026-10-26): every reserved
+     * region boundary MUST be 2 MiB (PMD) aligned. adjust_lowmem_
+     * bounds() in arch/arm/mm/mmu.c sets memblock_limit to the first
+     * non-PMD-aligned memblock range start; with CONFIG_HIGHMEM off,
+     * all RAM above round_down(that, 2M) is then dropped ("Ignoring
+     * RAM at ..."). The original ethpool end 0x44d00000 / ponbuf
+     * start 0x4e700000 were NOT 2M aligned, so a 256M map truncated
+     * to 0x44c00000 (MemTotal 54588). Aligning both regions to 2M
+     * keeps memblock_limit at the true top and maps the full range.
+     * Usable RAM = 256 - 26 (ponbuf) - 14 (ethpool) - kernel. */
     memory@40000000 {
         device_type = "memory";
-        reg = <0x40000000 0x0E000000>;
+        reg = <0x40000000 0x10000000>;
     };
 
     reserved-memory {
@@ -35,20 +46,32 @@
 
         /* Ethernet buffer pool: 2048x2 KiB buffer descriptors +
          * BE16 lookup tables + 8 RX rings + DMA status ring + TX
-         * ring (layout in zx279128-mac.c). no-map + driver ioremap
-         * keeps it uncached, matching how U-Boot drives the same
-         * hardware; the DMA engines are cache-unaware.
-         * Address choice: must stay clear of the kernel Image
-         * (ends ~0x40fc0000) AND of the appended DTB, which U-Boot
-         * leaves in place right after the decompressed kernel
-         * (~0x413eb000) and which the kernel reserves early — a
-         * pool at 0x41000000 collided with that DTB reservation
-         * and failed with -EBUSY (Gate G4 attempt 1, 2026-10-01).
-         * 0x44000000 was the uImage load address, dead after bootm;
-         * pool end 0x44d00000 is still below the stock reservation
-         * at ~0x4e700000. */
+         * ring (layout in zx279128-mac.c, top used offset
+         * POOL_TX_BASE 0xc00000 + 16 KiB < 0xd00000). no-map +
+         * driver ioremap keeps it uncached, matching how U-Boot
+         * drives the same hardware; the DMA engines are cache-
+         * unaware. Size padded 13M -> 14M so the pool END (0x44e00000)
+         * is 2 MiB aligned (see the memory node comment): the driver
+         * only uses rmem->size for devm_ioremap, so the extra 1 MiB
+         * of padding is harmless. Address choice unchanged: clear of
+         * the kernel Image and the appended DTB (Gate G4 attempt 1). */
         ethpool: ethpool@44000000 {
-            reg = <0x44000000 0x00d00000>;
+            reg = <0x44000000 0x00e00000>;
+            no-map;
+        };
+
+        /* Stock PON/TM packet-buffer region (Gate F2): the stock
+         * kernel memblock-reserves ~[0x4e700000, 0x50000000) and
+         * static-maps its first MiB; the packet DMA engines are
+         * cache-unaware and cspboot-era hardware state may reference
+         * it. no-map keeps it out of the kernel entirely. Start moved
+         * down to 0x4e600000 (2 MiB aligned, still below stock's
+         * 0x4e700000 so the whole stock region stays covered) and
+         * size 26M so the END is 0x50000000 (2 MiB aligned). Our
+         * zx279128-eth driver never touches it (all BMU/TM rings live
+         * in ethpool), but the reservation removes the last unknown. */
+        ponbuf@4e600000 {
+            reg = <0x4e600000 0x01a00000>;
             no-map;
         };
     };
